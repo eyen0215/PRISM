@@ -296,6 +296,221 @@ def train_all_predicates(
     return predicates
 
 
+# ===========================================================================
+# HOOKE'S LAW DOMAIN -- training functions
+# ===========================================================================
+
+from validity_predicates.predicate import (
+    HOOKE_FEATURE_COLS, HOOKE_N_FEATURES, HOOKE_LOG_COLS,
+)
+from data.generate import (
+    STRESS_RATIO_THRESHOLD, STRAIN_ENERGY_THRESHOLD, EPSILON_THRESHOLD,
+)
+
+HOOKE_TRAINABLE_ASSUMPTIONS = frozenset({
+    "A1_linearity", "A2_elasticity", "A3_small_strain"
+})
+
+# Each predicate observes only the feature directly measured by its criterion.
+# Using all three features causes a multicollinearity sign-flip in the skip:
+# stress_ratio, strain_energy_ratio, and epsilon are perfectly correlated in
+# the elastic training regime (all monotone in epsilon), so the linear skip
+# may assign a positive weight to strain_energy_ratio that fires the wrong
+# way when strain_energy_ratio is 1000x larger in the held-out regime.
+HOOKE_ASSUMPTION_FEATURES: Dict[str, list] = {
+    "A1_linearity":    ["stress_ratio"],
+    "A2_elasticity":   ["strain_energy_ratio"],
+    "A3_small_strain": ["epsilon"],
+}
+
+
+def make_hooke_features(df: pd.DataFrame) -> np.ndarray:
+    """Return [stress_ratio, strain_energy_ratio, epsilon] matrix, shape (N, 3)."""
+    return df[HOOKE_FEATURE_COLS].values.astype(np.float32)
+
+
+def compute_hooke_log_criterion(
+    df: pd.DataFrame,
+    assumption_id: str,
+) -> Optional[np.ndarray]:
+    """Return log-criterion regression target for one Hooke's Law assumption.
+
+    Target = log(threshold / feature_value):
+        > 0  when assumption is satisfied  (all training states)
+        = 0  at the validity boundary      (sigmoid gives 0.5)
+        < 0  when assumption is violated   (held-out, post-yield regime)
+
+    Features used are already dimensionless ratios so NO log-transform is
+    applied to the inputs before passing to the network.  The log() here is
+    only on the TARGET (regression label), not the feature.
+
+    Formulas
+    --------
+    A1 (linearity):
+        target = log(STRESS_RATIO_THRESHOLD / stress_ratio)
+        Training range: [log(0.9/0.50), log(0.9/0.04)] ~ [0.59, 3.11]
+
+    A2 (elasticity):
+        target = log(STRAIN_ENERGY_THRESHOLD / strain_energy_ratio)
+        where strain_energy_ratio = (sigma/sigma_y)^2
+        Training range: [log(0.8/0.25), log(0.8/0.0016)] ~ [1.16, 6.21]
+
+    A3 (small strain):
+        target = log(EPSILON_THRESHOLD / epsilon)
+        Training range: [log(0.85*ey/0.625*ey), log(0.85*ey/0.05*ey)] ~ [0.31, 2.83]
+
+    Returns None for A4 (homogeneity), which has no macroscopic criterion.
+    """
+    if assumption_id == "A1_linearity":
+        r = df["stress_ratio"].values.clip(1e-9)
+        return np.log(STRESS_RATIO_THRESHOLD / r).astype(np.float32)
+
+    if assumption_id == "A2_elasticity":
+        u = df["strain_energy_ratio"].values.clip(1e-9)
+        return np.log(STRAIN_ENERGY_THRESHOLD / u).astype(np.float32)
+
+    if assumption_id == "A3_small_strain":
+        eps = df["epsilon"].values.clip(1e-12)
+        return np.log(EPSILON_THRESHOLD / eps).astype(np.float32)
+
+    return None  # A4_homogeneity: not operationalizable
+
+
+def train_hooke_predicate(
+    assumption_id: str,
+    train_df: pd.DataFrame,
+    *,
+    hidden_dims: tuple = (32, 16),
+    lr: float = 1e-2,
+    n_epochs: int = 600,
+    val_frac: float = 0.15,
+    patience: int = 80,
+    seed: int = 0,
+    verbose: bool = False,
+) -> Optional[ValidityPredicate]:
+    """Train a ValidityPredicate for one Hooke's Law assumption.
+
+    Architecture differences from the ideal gas predicate:
+    - Features: [stress_ratio, strain_energy_ratio, epsilon]  (n_features=3)
+    - log_transform_cols=()  -- NO log-transform of inputs.
+      The validity boundaries are LINEAR in these dimensionless features
+      (not log-linear as in the ideal gas case), so the skip connection
+      extrapolates correctly without a log-transform.
+    - MLP weight_decay=5.0, skip weight_decay=0.0  -- same regularisation
+      strategy as ideal gas (prevents MLP constant-offset collapse).
+
+    Returns None for A4_homogeneity (no operationalizable criterion).
+    """
+    log_targets = compute_hooke_log_criterion(train_df, assumption_id)
+    if log_targets is None:
+        return None
+
+    feat_cols = HOOKE_ASSUMPTION_FEATURES.get(assumption_id)
+    if feat_cols is None:
+        return None
+
+    X_raw = train_df[feat_cols].values.astype(np.float32)
+    y_all = log_targets
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    idx   = rng.permutation(len(X_raw))
+    n_val = max(1, int(val_frac * len(X_raw)))
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    X_tr_raw, y_tr = X_raw[tr_idx], y_all[tr_idx]
+    X_val_raw, y_val = X_raw[val_idx], y_all[val_idx]
+
+    # Normalise on raw (non-log-transformed) training features
+    feat_mean = X_tr_raw.mean(axis=0).astype(np.float32)
+    feat_std  = (X_tr_raw.std(axis=0) + 1e-8).astype(np.float32)
+
+    predicate = ValidityPredicate(
+        hidden_dims=hidden_dims,
+        n_features=len(feat_cols),
+        log_transform_cols=HOOKE_LOG_COLS,
+        feature_cols=feat_cols,
+    )
+    predicate.set_normalization(feat_mean, feat_std)
+
+    optimizer = torch.optim.Adam([
+        {"params": predicate.skip.parameters(), "weight_decay": 0.0},
+        {"params": predicate.mlp.parameters(),  "weight_decay": 5.0},
+    ], lr=lr)
+    loss_fn = nn.MSELoss()
+
+    X_tr_t  = torch.from_numpy(X_tr_raw)
+    y_tr_t  = torch.from_numpy(y_tr)
+    X_val_t = torch.from_numpy(X_val_raw)
+    y_val_t = torch.from_numpy(y_val)
+
+    best_val   = float("inf")
+    best_sd    = None
+    no_improve = 0
+
+    for epoch in range(1, n_epochs + 1):
+        predicate.train()
+        optimizer.zero_grad()
+        loss = loss_fn(predicate(X_tr_t), y_tr_t)
+        loss.backward()
+        optimizer.step()
+
+        predicate.eval()
+        with torch.no_grad():
+            val_loss = loss_fn(predicate(X_val_t), y_val_t).item()
+
+        if val_loss < best_val - 1e-8:
+            best_val   = val_loss
+            best_sd    = copy.deepcopy(predicate.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                if verbose:
+                    print(f"  [{assumption_id}] early stop @ epoch {epoch}  "
+                          f"best val MSE = {best_val:.6f}")
+                break
+
+        if verbose and epoch % 100 == 0:
+            print(f"  [{assumption_id}]  epoch {epoch:4d}  "
+                  f"train={loss.item():.5f}  val={val_loss:.5f}")
+
+    if best_sd is not None:
+        predicate.load_state_dict(best_sd)
+
+    return predicate
+
+
+def train_all_hooke_predicates(
+    graph,
+    train_df: pd.DataFrame,
+    verbose: bool = True,
+    **train_kwargs,
+) -> Dict[str, ValidityPredicate]:
+    """Train one ValidityPredicate per trainable Hooke's Law assumption.
+
+    Trains A1 (linearity), A2 (elasticity), A3 (small strain).
+    Skips A4 (homogeneity) -- no macroscopic criterion.
+    Attaches each trained predicate to its assumption node in the graph.
+    """
+    predicates: Dict[str, ValidityPredicate] = {}
+
+    for node in graph.assumption_nodes():
+        if verbose:
+            print(f"  Training predicate for  {node.id} ...")
+        pred = train_hooke_predicate(node.id, train_df, verbose=verbose, **train_kwargs)
+        if pred is None:
+            if verbose:
+                print(f"    -> skipped (no operationalizable criterion)\n")
+            continue
+        node.attach_predicate(pred)
+        predicates[node.id] = pred
+        if verbose:
+            print(f"    -> done\n")
+
+    return predicates
+
+
 # ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------

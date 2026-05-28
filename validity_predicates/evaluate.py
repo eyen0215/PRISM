@@ -1,5 +1,5 @@
 """
-Evaluation metrics for validity predicates on the held-out high-pressure regime.
+Evaluation metrics for validity predicates on held-out regimes.
 
 Computes, per assumption:
     - Recall    -- primary metric (must not miss genuine breakdowns)
@@ -7,22 +7,17 @@ Computes, per assumption:
     - F1 score
     - AUROC     -- threshold-free ranking quality
 
-Also reports provenance-propagated flagging at the derived-node level,
-showing what fraction of downstream derivations are correctly marked suspect
-when at least one of their ancestor assumptions fires.
+Also reports provenance-propagated flagging at the derived-node level.
 
-Recall is the primary success metric for the MVP: we must not miss genuine
-breakdowns, even at the cost of some false alarms.  A predicate trained only
-on low-pressure data should fire (score < threshold) on held-out high-pressure
-states where the ideal gas assumptions provably fail.
+Domain configuration is passed as explicit dicts so the same functions
+work for both the ideal gas and Hooke's Law domains.
 
-Fits into the system: called from experiments/pilot.py after training; reads
-held-out data from data/generate.py; prints a metrics table per assumption.
+Fits into the system: called from experiments/pilot.py after training.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, FrozenSet, Optional
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,21 +26,32 @@ if TYPE_CHECKING:
     from reasoner.forward_chain import ForwardChainResult
     from reasoner.provenance import ProvenanceRecord
 
-# Maps assumption node IDs to the ground-truth label column in the DataFrame.
-# Only A1 and A2 have operationalizable analytical criteria from (P, V, T, n).
-LABEL_COLS: Dict[str, str] = {
+# ---------------------------------------------------------------------------
+# Ideal gas domain configuration
+# ---------------------------------------------------------------------------
+
+IG_LABEL_COLS: Dict[str, str] = {
     "A1_point_particles": "valid_point_particle",
     "A2_no_forces":       "valid_no_forces",
 }
 
-ASSUMPTION_LABELS: Dict[str, str] = {
+IG_ASSUMPTION_LABELS: Dict[str, str] = {
     "A1_point_particles":    "A1 - Point particles (no molecular volume)",
     "A2_no_forces":          "A2 - No intermolecular forces",
     "A3_elastic_collisions": "A3 - Elastic collisions         [no criterion]",
     "A4_thermal_equilibrium":"A4 - Thermal equilibrium        [no criterion]",
 }
 
-NODE_LABELS: Dict[str, str] = {
+IG_DERIVED_ORDER: List[str] = [
+    "D1_momentum_transfer",
+    "D2_collision_frequency",
+    "D3_mean_kinetic_energy",
+    "D4_single_particle_pressure",
+    "D5_pressure_ideal",
+    "D6_ideal_gas_law",
+]
+
+IG_NODE_LABELS: Dict[str, str] = {
     "D1_momentum_transfer":       "D1 - Momentum transfer per collision",
     "D2_collision_frequency":     "D2 - Wall collision frequency",
     "D3_mean_kinetic_energy":     "D3 - Mean translational kinetic energy",
@@ -54,13 +60,46 @@ NODE_LABELS: Dict[str, str] = {
     "D6_ideal_gas_law":           "D6 - Ideal gas law   PV = nRT  [PRIMARY]",
 }
 
-DERIVED_ORDER = [
-    "D1_momentum_transfer",
-    "D2_collision_frequency",
-    "D3_mean_kinetic_energy",
-    "D4_single_particle_pressure",
-    "D5_pressure_ideal",
-    "D6_ideal_gas_law",
+IG_ASSUMPTION_ORDER: List[str] = [
+    "A1_point_particles", "A2_no_forces",
+    "A3_elastic_collisions", "A4_thermal_equilibrium",
+]
+
+# ---------------------------------------------------------------------------
+# Hooke's Law domain configuration
+# ---------------------------------------------------------------------------
+
+HOOKE_LABEL_COLS: Dict[str, str] = {
+    "A1_linearity":   "valid_linearity",
+    "A2_elasticity":  "valid_elasticity",
+    "A3_small_strain":"valid_small_strain",
+}
+
+HOOKE_ASSUMPTION_LABELS: Dict[str, str] = {
+    "A1_linearity":    "A1 - Linearity (F proportional to x)",
+    "A2_elasticity":   "A2 - Elasticity (recoverable deformation)",
+    "A3_small_strain": "A3 - Small strain (geometry unchanged)",
+    "A4_homogeneity":  "A4 - Homogeneity (uniform material)  [no criterion]",
+}
+
+HOOKE_DERIVED_ORDER: List[str] = [
+    "D1_linear_response",
+    "D2_elastic_stiffness",
+    "D3_material_stiffness",
+    "D4_hookes_law",
+    "D5_deformation",
+]
+
+HOOKE_NODE_LABELS: Dict[str, str] = {
+    "D1_linear_response":   "D1 - Linear force-displacement response",
+    "D2_elastic_stiffness": "D2 - Elastic and constant stiffness",
+    "D3_material_stiffness":"D3 - Material stiffness k = EA/L0",
+    "D4_hookes_law":        "D4 - Hooke's Law  F = kx       [PRIMARY]",
+    "D5_deformation":       "D5 - Deformation  x = FL0/(EA)",
+}
+
+HOOKE_ASSUMPTION_ORDER: List[str] = [
+    "A1_linearity", "A2_elasticity", "A3_small_strain", "A4_homogeneity",
 ]
 
 
@@ -97,21 +136,21 @@ def _should_flag_for_node(
     node_id: str,
     prov_map: Dict[str, "ProvenanceRecord"],
     held_df: pd.DataFrame,
+    label_cols: Dict[str, str],
     n: int,
 ) -> Optional[np.ndarray]:
-    """Return bool array: states where this node SHOULD be flagged.
+    """Bool array: states where this node SHOULD be flagged.
 
-    A derived node should be flagged when at least one of its ancestor
-    assumptions with a known ground-truth label is analytically violated.
-    Returns None if none of the node's ancestor assumptions have labels
-    (e.g. D1 depends only on A3, which has no operationalizable criterion).
+    A node should be flagged when at least one ancestor assumption with a
+    known ground-truth label is analytically violated.  Returns None if none
+    of the node's ancestors have operationalizable criteria.
     """
     if node_id not in prov_map:
         return None
     anc_ids: FrozenSet[str] = prov_map[node_id].assumption_ids
     should = np.zeros(n, dtype=bool)
     has_label = False
-    for aid, col in LABEL_COLS.items():
+    for aid, col in label_cols.items():
         if aid in anc_ids and col in held_df.columns:
             should |= ~held_df[col].values.astype(bool)
             has_label = True
@@ -126,25 +165,33 @@ def evaluate_predicates(
     result: "ForwardChainResult",
     held_df: pd.DataFrame,
     prov_map: Optional[Dict[str, "ProvenanceRecord"]] = None,
+    label_cols: Optional[Dict[str, str]] = None,
+    derived_order: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Compute per-assumption and per-derived-node detection metrics.
 
     Parameters
     ----------
-    result   : output of run_forward_chain()
-    held_df  : held-out DataFrame from data.generate.generate_dataset()
-    prov_map : optional provenance map for precise per-node ground truth;
-               if None, a coarse union-of-all-assumptions ground truth is used
+    result       : output of run_forward_chain()
+    held_df      : held-out DataFrame from data.generate.*_dataset()
+    prov_map     : provenance map for precise per-node ground truth
+    label_cols   : {assumption_id: label_column_name}; defaults to ideal gas
+    derived_order: list of derived node IDs to evaluate; defaults to ideal gas
 
     Returns
     -------
     Nested dict {node_id: {metric_name: value}}.
     """
+    if label_cols is None:
+        label_cols = IG_LABEL_COLS
+    if derived_order is None:
+        derived_order = IG_DERIVED_ORDER
+
     metrics: Dict[str, Dict[str, float]] = {}
     n = result.n_states
 
     # ------ Per-assumption metrics ----------------------------------------
-    for assumption_id, label_col in LABEL_COLS.items():
+    for assumption_id, label_col in label_cols.items():
         if label_col not in held_df.columns:
             continue
         if assumption_id not in result.assumption_scores:
@@ -163,22 +210,20 @@ def evaluate_predicates(
         metrics[assumption_id] = m
 
     # ------ Derived-node flagging -----------------------------------------
-    for node_id in DERIVED_ORDER:
+    for node_id in derived_order:
         if node_id not in result.node_flagged:
             continue
         flagged_arr = result.node_flagged[node_id]
 
         if prov_map is not None:
-            should = _should_flag_for_node(node_id, prov_map, held_df, n)
+            should = _should_flag_for_node(node_id, prov_map, held_df, label_cols, n)
         else:
-            # Fallback: any state where A1 or A2 is violated
             should = np.zeros(n, dtype=bool)
-            for _, col in LABEL_COLS.items():
+            for _, col in label_cols.items():
                 if col in held_df.columns:
                     should |= ~held_df[col].values.astype(bool)
 
         if should is None:
-            # No operationalizable ancestor assumptions -- skip
             metrics[node_id] = {"skip": True}
             continue
 
@@ -196,24 +241,38 @@ def print_report(
     result: "ForwardChainResult",
     held_df: pd.DataFrame,
     prov_map: Optional[Dict[str, "ProvenanceRecord"]] = None,
+    assumption_order: Optional[List[str]] = None,
+    assumption_labels: Optional[Dict[str, str]] = None,
+    derived_order: Optional[List[str]] = None,
+    node_labels: Optional[Dict[str, str]] = None,
+    primary_node: Optional[str] = None,
 ) -> None:
-    """Print a formatted breakdown-detection report to stdout."""
-    n = result.n_states
+    """Print a formatted breakdown-detection report to stdout.
+
+    All domain-specific display config (labels, orderings, primary node) is
+    passed explicitly so the same function works for both domains.
+    """
+    if assumption_order  is None: assumption_order  = IG_ASSUMPTION_ORDER
+    if assumption_labels is None: assumption_labels = IG_ASSUMPTION_LABELS
+    if derived_order     is None: derived_order     = IG_DERIVED_ORDER
+    if node_labels       is None: node_labels       = IG_NODE_LABELS
+    if primary_node      is None: primary_node      = "D6_ideal_gas_law"
+
+    n   = result.n_states
     thr = result.threshold
 
     # ---- Assumption-level table -----------------------------------------
     print()
     print(f"  Per-assumption breakdown detection  (N={n}, threshold={thr})")
     print("  " + "-" * 74)
-    hdr = (f"  {'Assumption':<44} {'Violat':>6} {'Flaggd':>6} "
-           f"{'Recall':>7} {'Precis':>7} {'F1':>6} {'AUROC':>7}")
-    print(hdr)
+    print(f"  {'Assumption':<44} {'Violat':>6} {'Flaggd':>6} "
+          f"{'Recall':>7} {'Precis':>7} {'F1':>6} {'AUROC':>7}")
     print("  " + "-" * 74)
 
-    for assumption_id in ("A1_point_particles", "A2_no_forces"):
-        label = ASSUMPTION_LABELS.get(assumption_id, assumption_id)
-        m = metrics.get(assumption_id, {})
-        if m:
+    for assumption_id in assumption_order:
+        label = assumption_labels.get(assumption_id, assumption_id)
+        m     = metrics.get(assumption_id, {})
+        if m and not m.get("skip"):
             row = (f"  {label:<44} "
                    f"{m['n_violated']:>6} "
                    f"{m['n_flagged']:>6} "
@@ -225,12 +284,6 @@ def print_report(
             row = (f"  {label:<44} "
                    f"{'--':>6} {'--':>6} {'n/a':>7} {'n/a':>7} {'n/a':>6} {'n/a':>7}")
         print(row)
-
-    for assumption_id in ("A3_elastic_collisions", "A4_thermal_equilibrium"):
-        label = ASSUMPTION_LABELS.get(assumption_id, assumption_id)
-        print(f"  {label:<44} "
-              f"{'--':>6} {'--':>6} {'n/a':>7} {'n/a':>7} {'n/a':>6} {'n/a':>7}")
-
     print("  " + "-" * 74)
 
     # ---- Derived-node flagging table ------------------------------------
@@ -240,30 +293,30 @@ def print_report(
     print(f"  {'Node':<44} {'Should':>6} {'Flaggd':>6} {'Recall':>7}")
     print("  " + "-" * 62)
 
-    for node_id in DERIVED_ORDER:
-        label = NODE_LABELS.get(node_id, node_id)
-        m = metrics.get(node_id, {})
+    for node_id in derived_order:
+        label = node_labels.get(node_id, node_id)
+        m     = metrics.get(node_id, {})
         if not m or m.get("skip"):
-            # No operationalizable ancestor: show why it's skipped
-            note = "(A3/A4 only -- no criterion)"
-            print(f"  {label:<44} {'--':>6} {'--':>6} {'n/a':>7}  {note}")
+            print(f"  {label:<44} {'--':>6} {'--':>6} {'n/a':>7}  (no criterion in ancestors)")
         else:
             print(f"  {label:<44} "
                   f"{m['n_should_flag']:>6} "
                   f"{m['n_flagged']:>6} "
                   f"{m['recall']:>7.3f}")
-
     print("  " + "-" * 62)
 
-    # ---- Key result sentence ---------------------------------------------
-    a1 = metrics.get("A1_point_particles", {})
-    a2 = metrics.get("A2_no_forces", {})
-    d6 = metrics.get("D6_ideal_gas_law", {})
+    # ---- Key result sentence --------------------------------------------
+    primary_m = metrics.get(primary_node, {})
+    labeled_ms = {
+        aid: metrics[aid]
+        for aid in assumption_order
+        if aid in metrics and not metrics[aid].get("skip")
+    }
     print()
-    if d6 and not d6.get("skip") and a1 and a2:
-        print(f"  Key result:")
-        print(f"    A1 recall = {a1['recall']:.3f}   "
-              f"A2 recall = {a2['recall']:.3f}   "
-              f"D6 flagging recall = {d6['recall']:.3f}")
-        print(f"    Both predicates trained on P = 1-10 atm only.")
-        print(f"    Held-out regime P = 50-200 atm -- zero overlap with training.")
+    if labeled_ms and primary_m and not primary_m.get("skip"):
+        recall_parts = "   ".join(
+            f"{aid.split('_')[0]} recall = {m['recall']:.3f}"
+            for aid, m in labeled_ms.items()
+        )
+        print(f"  Key result:  {recall_parts}")
+        print(f"    {primary_node} flagging recall = {primary_m['recall']:.3f}")

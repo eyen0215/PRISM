@@ -1,183 +1,264 @@
 """
-Pilot experiment: train validity predicates on low-pressure data,
-evaluate on held-out high-pressure data.
+Pilot experiment: two physical domains, one framework.
 
-End-to-end script that implements the MVP result described in CLAUDE.md:
+Runs the full breakdown-detection pipeline for:
+    Domain 1 -- Ideal gas law  PV = nRT
+    Domain 2 -- Hooke's Law    F  = kx
 
-    1. Generate training (P 1–10 atm) and held-out (P 50–200 atm) datasets
-       via data/generate.py.
-    2. Build the hardcoded ideal gas axiom graph via axiom_graph/graph.py.
-    3. Train one ValidityPredicate per assumption on training data only,
-       via validity_predicates/train.py.
-    4. Run forward chaining on held-out states via reasoner/forward_chain.py
-       to obtain per-state provenance records.
-    5. Compute and print breakdown detection metrics via
-       validity_predicates/evaluate.py.
-    6. Plot the learned decision boundary (optional, --plot flag).
+Each domain follows the same five steps:
+    1. Generate training (valid regime) and held-out (breakdown regime) data.
+    2. Build the hardcoded axiom graph for that domain.
+    3. Train one ValidityPredicate per operationalizable assumption, on
+       training data only.
+    4. Run forward chaining on held-out states to propagate flags.
+    5. Compute and print Recall, Precision, F1, AUROC per assumption;
+       report provenance-propagated flagging of derived results.
 
-Success criterion: recall > 0.90 on held-out high-pressure states for both
-operationalizable assumptions (point-particle, no-forces), without any
-high-pressure data seen during training.
+Success criterion: Recall >= 0.90 on held-out data for all operationalizable
+assumptions, in both domains, with zero held-out data seen during training.
+
+Architecture note (see DECISIONS.md for full analysis):
+  Both domains use the same skip-connection MLP class (ValidityPredicate).
+  The key difference is log_transform_cols:
+    Ideal gas  -- (0, 1, 2): log-transforms P, V, T because the validity
+                  criteria are log-linear in log(V) and log(T).
+    Hooke's Law -- (): NO log-transform; features are already dimensionless
+                  ratios (stress_ratio, strain_energy_ratio, epsilon) whose
+                  validity boundaries are linear, not log-linear.
+  The skip connection (linear extrapolation path) is critical in both cases.
 
 Usage
 -----
-    python -m experiments.pilot           # run experiment, no plot
-    python -m experiments.pilot --plot    # also save decision boundary figure
+    python -m experiments.pilot           # both domains, no plots
+    python -m experiments.pilot --plot    # also save decision boundary figures
 """
 
-# Windows / Anaconda sometimes links two OpenMP runtimes; this suppresses the
-# fatal error without affecting correctness.
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import sys
 import time
 from pathlib import Path
+from typing import Dict
 
 # ---------------------------------------------------------------------------
-# Experiment parameters — change here to reproduce with different settings
+# Experiment parameters
 # ---------------------------------------------------------------------------
 N_TRAIN    = 5_000
 N_HELD_OUT = 2_000
 SEED       = 42
-THRESHOLD  = 0.5      # validity score below which a predicate is considered fired
+THRESHOLD  = 0.5
 HIDDEN_DIMS = (32, 16)
 LR          = 1e-2
 N_EPOCHS    = 600
 
-PLOT_PATH = "outputs/decision_boundary.png"
+IG_PLOT_PATH    = "outputs/ig_decision_boundary.png"
+HOOKE_PLOT_PATH = "outputs/hooke_decision_boundary.png"
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _banner(title: str) -> None:
-    width = 66
-    print()
-    print("=" * width)
-    print(f"  {title}")
-    print("=" * width)
+    w = 66
+    print(); print("=" * w); print(f"  {title}"); print("=" * w)
 
-
-def _step(n: int, msg: str) -> float:
-    print(f"\n  Step {n}/5  {msg}", end="", flush=True)
+def _step(n: int, total: int, msg: str) -> float:
+    print(f"\n  Step {n}/{total}  {msg}", end="", flush=True)
     return time.perf_counter()
 
-
 def _done(t0: float) -> None:
-    elapsed = time.perf_counter() - t0
-    print(f"  [{elapsed:.1f}s]")
+    print(f"  [{time.perf_counter() - t0:.1f}s]")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Domain 1: Ideal gas
 # ---------------------------------------------------------------------------
 
-def main(plot: bool = False) -> None:
-    _banner("AXIOM-AI PILOT EXPERIMENT — Ideal Gas Breakdown Detection")
+def run_ideal_gas_experiment(plot: bool = False) -> Dict:
+    """Full breakdown-detection pipeline for the ideal gas domain."""
+    _banner("DOMAIN 1 -- Ideal Gas Law  PV = nRT")
+    print(f"\n  Training : P = 1-10 atm     ({N_TRAIN} states, all ideal-gas-valid)")
+    print(f"  Held-out : P = 50-200 atm   ({N_HELD_OUT} states, van der Waals regime)")
 
-    print(f"\n  Setup")
-    print(f"    Training regime : P = 1–10 atm   ({N_TRAIN} states, ideal-gas-valid)")
-    print(f"    Held-out regime : P = 50–200 atm ({N_HELD_OUT} states, van der Waals regime)")
-    print(f"    Threshold       : score < {THRESHOLD} -> assumption flagged")
-
-    # ------------------------------------------------------------------ 1/5
-    t0 = _step(1, "Generating synthetic data ...")
+    t0 = _step(1, 5, "Generating data ...")
     from data.generate import generate_dataset
-    train_df, held_df = generate_dataset(
-        n_train=N_TRAIN, n_held_out=N_HELD_OUT, seed=SEED
-    )
+    train_df, held_df = generate_dataset(n_train=N_TRAIN, n_held_out=N_HELD_OUT, seed=SEED)
     _done(t0)
-    print(f"       train : {len(train_df)} states  "
-          f"(A1 valid: {train_df['valid_point_particle'].mean():.1%},  "
-          f"A2 valid: {train_df['valid_no_forces'].mean():.1%})")
-    print(f"       held  : {len(held_df)} states  "
-          f"(A1 valid: {held_df['valid_point_particle'].mean():.1%},  "
-          f"A2 valid: {held_df['valid_no_forces'].mean():.1%})")
+    print(f"       train A1={train_df['valid_point_particle'].mean():.0%} valid  "
+          f"A2={train_df['valid_no_forces'].mean():.0%} valid")
+    print(f"       held  A1={held_df['valid_point_particle'].mean():.0%} valid  "
+          f"A2={held_df['valid_no_forces'].mean():.0%} valid")
 
-    # ------------------------------------------------------------------ 2/5
-    t0 = _step(2, "Building axiom graph ...")
+    t0 = _step(2, 5, "Building axiom graph ...")
     from axiom_graph.graph import build_ideal_gas_graph
     graph = build_ideal_gas_graph()
     _done(t0)
-    n_nodes = len(graph.nodes)
-    n_edges = len(graph.edges)
-    n_assump = len(graph.assumption_nodes())
-    print(f"       {n_nodes} nodes  ({n_assump} assumption nodes)  {n_edges} derivation edges")
+    print(f"       {len(graph.nodes)} nodes, {len(graph.edges)} edges, "
+          f"{len(graph.assumption_nodes())} assumption nodes")
 
-    # ------------------------------------------------------------------ 3/5
-    t0 = _step(3, "Training validity predicates ...\n")
+    t0 = _step(3, 5, "Training validity predicates ...\n")
     from validity_predicates.train import train_all_predicates
     predicates = train_all_predicates(
-        graph, train_df,
-        verbose=True,
-        hidden_dims=HIDDEN_DIMS,
-        lr=LR,
-        n_epochs=N_EPOCHS,
+        graph, train_df, verbose=True,
+        hidden_dims=HIDDEN_DIMS, lr=LR, n_epochs=N_EPOCHS,
     )
     _done(t0)
-    print(f"       Trained {len(predicates)} predicate(s): "
-          + ", ".join(predicates.keys()))
+    print(f"       Trained: {', '.join(predicates)}")
 
-    # ------------------------------------------------------------------ 4/5
-    t0 = _step(4, "Running forward chain on held-out data ...")
+    t0 = _step(4, 5, "Running forward chain ...")
     from reasoner.forward_chain import run_forward_chain
     from reasoner.provenance import compute_provenance
     result   = run_forward_chain(graph, held_df, threshold=THRESHOLD)
     prov_map = compute_provenance(graph)
     _done(t0)
 
-    # ------------------------------------------------------------------ 5/5
-    t0 = _step(5, "Computing metrics ...")
-    from validity_predicates.evaluate import evaluate_predicates, print_report
-    metrics = evaluate_predicates(result, held_df, prov_map=prov_map)
+    t0 = _step(5, 5, "Computing metrics ...")
+    from validity_predicates.evaluate import (
+        evaluate_predicates, print_report,
+        IG_LABEL_COLS, IG_ASSUMPTION_ORDER, IG_ASSUMPTION_LABELS,
+        IG_DERIVED_ORDER, IG_NODE_LABELS,
+    )
+    metrics = evaluate_predicates(
+        result, held_df, prov_map=prov_map, label_cols=IG_LABEL_COLS,
+        derived_order=IG_DERIVED_ORDER,
+    )
     _done(t0)
 
-    # ------------------------------------------------------------------ Report
-    _banner("BREAKDOWN DETECTION RESULTS")
-    print_report(metrics, result, held_df, prov_map=prov_map)
+    _banner("IDEAL GAS -- Breakdown Detection Results")
+    print_report(
+        metrics, result, held_df, prov_map=prov_map,
+        assumption_order=IG_ASSUMPTION_ORDER,
+        assumption_labels=IG_ASSUMPTION_LABELS,
+        derived_order=IG_DERIVED_ORDER,
+        node_labels=IG_NODE_LABELS,
+        primary_node="D6_ideal_gas_law",
+    )
 
-    # ------------------------------------------------------------------ Optional plot
     if plot:
-        print()
-        print("  Generating decision boundary plot ...")
-        import matplotlib
-        matplotlib.use("Agg")
+        print("\n  Generating decision boundary plot ...")
+        import matplotlib; matplotlib.use("Agg")
         from validity_predicates.train import plot_decision_boundary
-        Path(PLOT_PATH).parent.mkdir(parents=True, exist_ok=True)
-        plot_decision_boundary(
-            predicates, train_df, held_df, save_path=PLOT_PATH
-        )
-        print(f"  Saved -> {PLOT_PATH}")
+        Path(IG_PLOT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        plot_decision_boundary(predicates, train_df, held_df, save_path=IG_PLOT_PATH)
+        print(f"  Saved -> {IG_PLOT_PATH}")
 
-    # ------------------------------------------------------------------ Pass/fail
-    a1_recall = metrics.get("A1_point_particles", {}).get("recall", 0.0)
-    a2_recall = metrics.get("A2_no_forces", {}).get("recall", 0.0)
-    d6_recall = metrics.get("D6_ideal_gas_law", {}).get("recall", 0.0)
+    return metrics
 
-    _banner("PASS / FAIL")
+
+# ---------------------------------------------------------------------------
+# Domain 2: Hooke's Law
+# ---------------------------------------------------------------------------
+
+def run_hooke_experiment(plot: bool = False) -> Dict:
+    """Full breakdown-detection pipeline for the Hooke's Law domain."""
+    _banner("DOMAIN 2 -- Hooke's Law  F = kx  (steel rod)")
+    print(f"\n  Training : epsilon = 0.005-0.0625%   ({N_TRAIN} states, elastic regime)")
+    print(f"  Held-out : epsilon = 0.1875-1.25%    ({N_HELD_OUT} states, post-yield regime)")
+    print(f"  Material : steel  E=200 GPa  sigma_y=250 MPa")
+
+    t0 = _step(1, 5, "Generating data ...")
+    from data.generate import generate_hooke_dataset
+    train_df, held_df = generate_hooke_dataset(n_train=N_TRAIN, n_held_out=N_HELD_OUT, seed=SEED)
+    _done(t0)
+    print(f"       train A1={train_df['valid_linearity'].mean():.0%}  "
+          f"A2={train_df['valid_elasticity'].mean():.0%}  "
+          f"A3={train_df['valid_small_strain'].mean():.0%}")
+    print(f"       held  A1={held_df['valid_linearity'].mean():.0%}  "
+          f"A2={held_df['valid_elasticity'].mean():.0%}  "
+          f"A3={held_df['valid_small_strain'].mean():.0%}")
+
+    t0 = _step(2, 5, "Building axiom graph ...")
+    from axiom_graph.graph import build_hooke_law_graph
+    graph = build_hooke_law_graph()
+    _done(t0)
+    print(f"       {len(graph.nodes)} nodes, {len(graph.edges)} edges, "
+          f"{len(graph.assumption_nodes())} assumption nodes")
+
+    t0 = _step(3, 5, "Training validity predicates ...\n")
+    from validity_predicates.train import train_all_hooke_predicates
+    predicates = train_all_hooke_predicates(
+        graph, train_df, verbose=True,
+        hidden_dims=HIDDEN_DIMS, lr=LR, n_epochs=N_EPOCHS,
+    )
+    _done(t0)
+    print(f"       Trained: {', '.join(predicates)}")
+
+    t0 = _step(4, 5, "Running forward chain ...")
+    from reasoner.forward_chain import run_forward_chain
+    from reasoner.provenance import compute_provenance
+    result   = run_forward_chain(graph, held_df, threshold=THRESHOLD)
+    prov_map = compute_provenance(graph)
+    _done(t0)
+
+    t0 = _step(5, 5, "Computing metrics ...")
+    from validity_predicates.evaluate import (
+        evaluate_predicates, print_report,
+        HOOKE_LABEL_COLS, HOOKE_ASSUMPTION_ORDER, HOOKE_ASSUMPTION_LABELS,
+        HOOKE_DERIVED_ORDER, HOOKE_NODE_LABELS,
+    )
+    metrics = evaluate_predicates(
+        result, held_df, prov_map=prov_map, label_cols=HOOKE_LABEL_COLS,
+        derived_order=HOOKE_DERIVED_ORDER,
+    )
+    _done(t0)
+
+    _banner("HOOKE'S LAW -- Breakdown Detection Results")
+    print_report(
+        metrics, result, held_df, prov_map=prov_map,
+        assumption_order=HOOKE_ASSUMPTION_ORDER,
+        assumption_labels=HOOKE_ASSUMPTION_LABELS,
+        derived_order=HOOKE_DERIVED_ORDER,
+        node_labels=HOOKE_NODE_LABELS,
+        primary_node="D4_hookes_law",
+    )
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Pass / fail summary
+# ---------------------------------------------------------------------------
+
+def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict) -> None:
+    _banner("PASS / FAIL -- Both Domains")
     target = 0.90
-    results_line = [
-        ("A1 recall", a1_recall, target),
-        ("A2 recall", a2_recall, target),
-        ("D6 flagging recall", d6_recall, target),
+
+    checks = [
+        ("IG   A1 recall (point particles)", ig_metrics.get("A1_point_particles", {}).get("recall", 0)),
+        ("IG   A2 recall (no forces)",       ig_metrics.get("A2_no_forces",       {}).get("recall", 0)),
+        ("IG   D6 flagging recall",          ig_metrics.get("D6_ideal_gas_law",   {}).get("recall", 0)),
+        ("Hook A1 recall (linearity)",       hooke_metrics.get("A1_linearity",    {}).get("recall", 0)),
+        ("Hook A2 recall (elasticity)",      hooke_metrics.get("A2_elasticity",   {}).get("recall", 0)),
+        ("Hook A3 recall (small strain)",    hooke_metrics.get("A3_small_strain", {}).get("recall", 0)),
+        ("Hook D4 flagging recall",          hooke_metrics.get("D4_hookes_law",   {}).get("recall", 0)),
     ]
+
     all_pass = True
-    for name, val, tgt in results_line:
-        status = "PASS" if val >= tgt else "FAIL"
-        if val < tgt:
+    for name, val in checks:
+        status = "PASS" if val >= target else "FAIL"
+        if val < target:
             all_pass = False
-        print(f"    {name:<22} = {val:.3f}   (target >= {tgt})  [{status}]")
+        print(f"    {name:<38} = {val:.3f}   (>= {target})  [{status}]")
 
     print()
     if all_pass:
-        print("  All targets met.  Core MVP result achieved.")
+        print("  All targets met.  Framework generalises across both physical domains.")
     else:
-        print("  One or more targets not met.  See report above.")
+        print("  One or more targets not met -- see reports above.")
     print()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(plot: bool = False) -> None:
+    ig_metrics    = run_ideal_gas_experiment(plot=plot)
+    hooke_metrics = run_hooke_experiment(plot=plot)
+    _pass_fail(ig_metrics, hooke_metrics)
+
+
 if __name__ == "__main__":
-    plot_flag = "--plot" in sys.argv
-    main(plot=plot_flag)
+    main(plot="--plot" in sys.argv)

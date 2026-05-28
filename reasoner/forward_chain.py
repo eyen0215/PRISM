@@ -33,11 +33,6 @@ import pandas as pd
 
 from axiom_graph.graph import AxiomGraph
 from reasoner.provenance import compute_provenance
-from validity_predicates.predicate import FEATURE_COLS
-
-
-def _make_features(df: pd.DataFrame) -> np.ndarray:
-    return df[FEATURE_COLS].values.astype(np.float32)
 
 
 @dataclass
@@ -80,7 +75,7 @@ def run_forward_chain(
     ----------
     graph     : AxiomGraph with ValidityPredicates already attached to
                 assumption nodes via node.attach_predicate()
-    df        : DataFrame containing columns matching FEATURE_COLS (P, V, T, n)
+    df        : DataFrame containing all feature columns needed by the attached predicates
     threshold : validity score below which a predicate is considered to have fired
 
     Returns
@@ -88,7 +83,6 @@ def run_forward_chain(
     ForwardChainResult with arrays of length len(df).
     """
     n = len(df)
-    features = _make_features(df)
 
     # ------------------------------------------------------------------
     # Step 1 — score every assumption node
@@ -98,6 +92,8 @@ def run_forward_chain(
 
     for node in graph.assumption_nodes():
         if node.validity_predicate is not None:
+            feat_cols = node.validity_predicate.feature_cols
+            features = df[feat_cols].values.astype(np.float32)
             scores = node.validity_predicate.predict(features)
             assumption_scores[node.id] = scores
             assumption_flagged[node.id] = scores < threshold

@@ -369,3 +369,191 @@ def build_ideal_gas_graph() -> AxiomGraph:
     ))
 
     return g
+
+
+# ---------------------------------------------------------------------------
+# Hooke's Law axiom graph
+# ---------------------------------------------------------------------------
+
+def build_hooke_law_graph() -> AxiomGraph:
+    """Construct and return the hardcoded Hooke's Law axiom DAG.
+
+    Derivation chain for F = kx (uniaxial linear elasticity):
+
+        obs_*  -- observable quantities: F (force), x (displacement),
+                  A (cross-section), L0 (original length)
+        A1..A4 -- physical assumptions
+        D1..D5 -- derived intermediate and final results
+
+    Edge topology (premises -> conclusion):
+
+        E1: [A1]          -> D1_linear_response     F proportional to x
+        E2: [A2, A3]      -> D2_elastic_stiffness   k>0 and k constant
+        E3: [A4]          -> D3_material_stiffness  k = EA/L0
+        E4: [D1, D2, D3]  -> D4_hookes_law          F = kx  (the law)
+        E5: [D4]          -> D5_deformation         x = F/k (inverse form)
+
+    Ancestor assumptions of D5: {A1, A2, A3, A4} -- all four.
+
+    A4 (homogeneity) has no operationalizable validity criterion from
+    macroscopic (F, x, A, L0) observables -- its predicate is skipped,
+    analogous to A3/A4 in the ideal gas graph.
+    """
+    g = AxiomGraph()
+
+    # ---- Observable nodes ------------------------------------------------
+    g.add_node(Node(
+        id="obs_F", kind="observable",
+        label="Applied force F",
+        description="Force applied to the rod in Newtons, directly measurable.",
+    ))
+    g.add_node(Node(
+        id="obs_x", kind="observable",
+        label="Displacement x",
+        description="Elongation of the rod in metres, directly measurable.",
+    ))
+    g.add_node(Node(
+        id="obs_A", kind="observable",
+        label="Cross-section A",
+        description="Cross-sectional area of the rod in m^2, directly measurable.",
+    ))
+    g.add_node(Node(
+        id="obs_L0", kind="observable",
+        label="Original length L0",
+        description="Undeformed length of the rod in metres, directly measurable.",
+    ))
+
+    # ---- Assumption nodes ------------------------------------------------
+    g.add_node(Node(
+        id="A1_linearity", kind="assumption",
+        label="Linearity (A1)",
+        description=(
+            "Deformation is proportional to applied force: F = c*x for some "
+            "constant c.  Violated past the yield point where the F-x "
+            "relationship becomes nonlinear (plastic deformation)."
+        ),
+    ))
+    g.add_node(Node(
+        id="A2_elasticity", kind="assumption",
+        label="Elasticity (A2)",
+        description=(
+            "The material returns to its original shape when the load is removed. "
+            "Stored strain energy is fully recoverable.  Violated past yield "
+            "where permanent (plastic) deformation occurs."
+        ),
+    ))
+    g.add_node(Node(
+        id="A3_small_strain", kind="assumption",
+        label="Small strain (A3)",
+        description=(
+            "Deformation x is small relative to the original length L0, so "
+            "the geometry (and hence the stiffness k = EA/L0) does not "
+            "change appreciably during loading.  Violated at large displacements."
+        ),
+    ))
+    g.add_node(Node(
+        id="A4_homogeneity", kind="assumption",
+        label="Material homogeneity (A4)",
+        description=(
+            "Material properties (Young's modulus E) are uniform throughout "
+            "the cross-section and along the length.  Required for the "
+            "constitutive relation k = EA/L0 to hold globally."
+        ),
+    ))
+
+    # ---- Derived nodes ---------------------------------------------------
+    g.add_node(Node(
+        id="D1_linear_response", kind="derived",
+        label="Linear force-displacement response",
+        description=(
+            "Under assumption A1, F = c*x for some proportionality constant c, "
+            "establishing that force and displacement are linearly related."
+        ),
+    ))
+    g.add_node(Node(
+        id="D2_elastic_stiffness", kind="derived",
+        label="Elastic and constant stiffness",
+        description=(
+            "A2 ensures the stiffness constant k is positive (restoring force); "
+            "A3 ensures k does not change with deformation (geometry fixed)."
+        ),
+    ))
+    g.add_node(Node(
+        id="D3_material_stiffness", kind="derived",
+        label="Material stiffness k = EA/L0",
+        description=(
+            "Homogeneity (A4) allows integration of the stress-strain relation "
+            "sigma = E*epsilon over the rod to give k = E*A/L0."
+        ),
+    ))
+    g.add_node(Node(
+        id="D4_hookes_law", kind="derived",
+        label="Hooke's Law  F = kx",
+        description=(
+            "Combining linear response (D1), elastic constant stiffness (D2), "
+            "and the material stiffness k = EA/L0 (D3) gives F = kx = (EA/L0)*x."
+        ),
+    ))
+    g.add_node(Node(
+        id="D5_deformation", kind="derived",
+        label="Elastic deformation  x = F/k = FL0/(EA)",
+        description=(
+            "Inverting Hooke's Law gives the deformation formula used in "
+            "structural engineering: x = F*L0 / (E*A)."
+        ),
+    ))
+
+    # ---- Edges -----------------------------------------------------------
+    g.add_edge(DerivationEdge(
+        id="HE1",
+        premise_ids=["A1_linearity"],
+        conclusion_id="D1_linear_response",
+        rule_label="Linearity -> F proportional to x",
+        description=(
+            "If deformation is proportional to force (A1), then F = c*x "
+            "for some constant c that characterises the material stiffness."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="HE2",
+        premise_ids=["A2_elasticity", "A3_small_strain"],
+        conclusion_id="D2_elastic_stiffness",
+        rule_label="Elasticity + small strain -> k positive and constant",
+        description=(
+            "A2 guarantees k > 0 (elastic restoring force, energy recoverable). "
+            "A3 guarantees k does not change with deformation (x << L0, "
+            "so the geometry -- and hence k = EA/L0 -- remains fixed)."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="HE3",
+        premise_ids=["A4_homogeneity"],
+        conclusion_id="D3_material_stiffness",
+        rule_label="Homogeneity -> k = EA/L0",
+        description=(
+            "Uniform material properties allow integration of sigma = E*epsilon "
+            "over the rod cross-section and length to yield k = E*A/L0."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="HE4",
+        premise_ids=["D1_linear_response", "D2_elastic_stiffness", "D3_material_stiffness"],
+        conclusion_id="D4_hookes_law",
+        rule_label="Linear response + elastic stiffness + material k -> F = kx",
+        description=(
+            "The three intermediate results combine to give Hooke's Law: "
+            "F = k*x = (E*A/L0)*x, the defining equation of linear elasticity."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="HE5",
+        premise_ids=["D4_hookes_law"],
+        conclusion_id="D5_deformation",
+        rule_label="F = kx -> x = FL0/(EA)",
+        description=(
+            "Rearranging Hooke's Law gives the deformation formula: "
+            "x = F/k = F*L0/(E*A), the standard result used in structural design."
+        ),
+    ))
+
+    return g

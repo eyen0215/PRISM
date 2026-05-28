@@ -288,6 +288,184 @@ def visualize_regime_boundary(
     plt.show()
 
 
+# ===========================================================================
+# HOOKE'S LAW DOMAIN
+# ===========================================================================
+#
+# Synthetic data for F = kx (Hooke's Law / linear elasticity).
+# Material: steel rod under uniaxial tension.
+#
+# The four assumptions and their analytical validity criteria:
+#
+#   A1 (Linearity)   : stress ratio r = sigma/sigma_y  < STRESS_RATIO_THRESHOLD
+#                      Violated past yield when F-x response becomes nonlinear.
+#
+#   A2 (Elasticity)  : strain energy ratio U/U_yield   < STRAIN_ENERGY_THRESHOLD
+#                      Violated when stored energy exceeds the elastic limit.
+#                      U = sigma^2 / (2*E), so U/U_yield = r^2.
+#
+#   A3 (Small strain): strain epsilon = x/L0            < EPSILON_THRESHOLD
+#                      Violated when geometric nonlinearity (large displacement)
+#                      changes the effective stiffness k = EA/L0.
+#
+#   A4 (Homogeneity) : no operationalizable criterion from macroscopic
+#                      (F, x, A, L0) alone -- skipped (like A3/A4 in ideal gas).
+#
+# Features stored in the DataFrame: F (N), x (m), A (m^2), L0 (m),
+#   sigma (Pa), epsilon (dimensionless), stress_ratio (dimensionless),
+#   strain_energy_ratio (dimensionless).
+#
+# The predicate uses ['stress_ratio', 'strain_energy_ratio', 'epsilon'] directly
+# WITHOUT log-transform, because the validity boundaries are LINEAR in these
+# normalised features (not log-linear as in the ideal gas case).
+# ---------------------------------------------------------------------------
+
+# Material constants -- steel
+E_STEEL  = 200e9    # Young's modulus (Pa)
+SIGMA_Y  = 250e6    # Yield strength (Pa)
+EPSILON_Y = SIGMA_Y / E_STEEL          # Yield strain = 0.00125
+U_YIELD   = SIGMA_Y**2 / (2 * E_STEEL) # Yield strain energy density (J/m^3) = 156250
+
+# Regime boundaries -- split cleanly around the yield strain
+EPSILON_TRAIN_LOW  = 0.00005            # 0.005% strain (well within elastic)
+EPSILON_TRAIN_HIGH = EPSILON_Y * 0.50   # 0.0625%  (50% of yield)
+EPSILON_TEST_LOW   = EPSILON_Y * 1.50   # 0.1875%  (past yield)
+EPSILON_TEST_HIGH  = EPSILON_Y * 10.0   # 1.25%    (strongly post-yield)
+
+# Geometry sampling ranges
+A_LOW  = 1e-4   # 1 cm^2 cross-sectional area
+A_HIGH = 1e-2   # 100 cm^2
+L0_LOW  = 0.10  # 10 cm rod length
+L0_HIGH = 2.00  # 2 m
+
+# Validity thresholds (slightly below the physical yield to give margin)
+STRESS_RATIO_THRESHOLD    = 0.90   # A1: sigma/sigma_y must be below this
+STRAIN_ENERGY_THRESHOLD   = 0.80   # A2: U/U_yield must be below this
+EPSILON_THRESHOLD         = EPSILON_Y * 0.85  # A3: epsilon threshold
+
+
+def compute_hooke_validity_labels(
+    stress_ratio: np.ndarray,
+    strain_energy_ratio: np.ndarray,
+    epsilon: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Analytically compute per-assumption validity labels for Hooke's Law.
+
+    Returns
+    -------
+    valid_linearity      : bool array -- A1 satisfied (stress ratio below threshold)
+    valid_elasticity     : bool array -- A2 satisfied (strain energy ratio below threshold)
+    valid_small_strain   : bool array -- A3 satisfied (strain below threshold)
+    """
+    return (
+        stress_ratio      < STRESS_RATIO_THRESHOLD,
+        strain_energy_ratio < STRAIN_ENERGY_THRESHOLD,
+        epsilon           < EPSILON_THRESHOLD,
+    )
+
+
+def generate_hooke_regime(
+    n_samples: int,
+    epsilon_low: float,
+    epsilon_high: float,
+    regime_label: str = "train",
+    rng: np.random.Generator = None,
+    noise_frac: float = 0.002,
+) -> pd.DataFrame:
+    """Sample n_samples Hooke's Law states uniformly in [epsilon_low, epsilon_high].
+
+    Geometry (A, L0) is sampled independently.  Force F and displacement x are
+    derived from the linear elastic relation sigma = E*epsilon so that Hooke's
+    Law is the ground truth in the training regime.  The same linear formula is
+    applied in the held-out regime -- the discrepancy with true post-yield
+    behaviour is what the predicates must detect.
+
+    Parameters
+    ----------
+    n_samples          : number of states to generate
+    epsilon_low/high   : strain sampling range
+    regime_label       : 'train' or 'held_out'
+    rng                : seeded Generator for reproducibility
+    noise_frac         : fractional std of Gaussian noise (0.2%)
+
+    Returns
+    -------
+    DataFrame with columns: F, x, A, L0, sigma, epsilon,
+        stress_ratio, strain_energy_ratio, regime,
+        valid_linearity, valid_elasticity, valid_small_strain
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    epsilon = rng.uniform(epsilon_low, epsilon_high, n_samples)
+    A       = rng.uniform(A_LOW,  A_HIGH,  n_samples)
+    L0      = rng.uniform(L0_LOW, L0_HIGH, n_samples)
+
+    sigma = E_STEEL * epsilon          # stress (Pa) via Hooke's Law
+    F     = sigma * A                  # force (N)
+    x     = epsilon * L0               # displacement (m)
+
+    # Small measurement noise
+    epsilon = epsilon * (1.0 + rng.normal(0.0, noise_frac, n_samples))
+    F       = F       * (1.0 + rng.normal(0.0, noise_frac, n_samples))
+    x       = x       * (1.0 + rng.normal(0.0, noise_frac, n_samples))
+    A       = A       * (1.0 + rng.normal(0.0, noise_frac, n_samples))
+    L0      = L0      * (1.0 + rng.normal(0.0, noise_frac, n_samples))
+
+    # Re-derive engineered features from noisy observables
+    epsilon_derived      = np.clip(x / L0, 1e-12, None)
+    sigma_derived        = np.clip(F / A,  1e-12, None)
+    stress_ratio         = sigma_derived / SIGMA_Y
+    strain_energy_ratio  = stress_ratio**2          # = (sigma/sigma_y)^2 = U/U_yield
+    strain_energy        = sigma_derived**2 / (2 * E_STEEL)  # J/m^3 (physical U)
+
+    vl, ve, vs = compute_hooke_validity_labels(
+        stress_ratio, strain_energy_ratio, epsilon_derived
+    )
+
+    return pd.DataFrame({
+        "F":                   F,
+        "x":                   x,
+        "A":                   A,
+        "L0":                  L0,
+        "sigma":               sigma_derived,
+        "epsilon":             epsilon_derived,
+        "stress_ratio":        stress_ratio,
+        "strain_energy_ratio": strain_energy_ratio,
+        "strain_energy":       strain_energy,
+        "regime":              regime_label,
+        "valid_linearity":     vl,
+        "valid_elasticity":    ve,
+        "valid_small_strain":  vs,
+    })
+
+
+def generate_hooke_dataset(
+    n_train: int = 5000,
+    n_held_out: int = 2000,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate training / held-out dataset pair for Hooke's Law.
+
+    Training:  epsilon in [EPSILON_TRAIN_LOW, EPSILON_TRAIN_HIGH]  (elastic regime)
+    Held-out:  epsilon in [EPSILON_TEST_LOW,  EPSILON_TEST_HIGH]   (post-yield)
+
+    Returns
+    -------
+    train_df, held_out_df
+    """
+    rng = np.random.default_rng(seed)
+    train_df = generate_hooke_regime(
+        n_train, EPSILON_TRAIN_LOW, EPSILON_TRAIN_HIGH,
+        regime_label="train", rng=rng,
+    )
+    held_out_df = generate_hooke_regime(
+        n_held_out, EPSILON_TEST_LOW, EPSILON_TEST_HIGH,
+        regime_label="held_out", rng=rng,
+    )
+    return train_df, held_out_df
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
