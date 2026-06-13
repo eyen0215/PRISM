@@ -211,6 +211,28 @@ def evaluate(save_figures: bool = True) -> dict:
     print(f"  AUROC = {bl_auroc:.4f}")
     print()
 
+    # ---- Skip vs MLP path breakdown for extreme held-out pressures ---------
+    ho_P = test_data["P"]
+    idx_lo = int(np.argmin(ho_P))
+    idx_hi = int(np.argmax(ho_P))
+
+    def _skip_mlp(predicate, x_raw: np.ndarray):
+        predicate.eval()
+        with torch.no_grad():
+            x = torch.from_numpy(x_raw.astype(np.float32))
+            for col in predicate._log_transform_cols:
+                x[..., col] = torch.log(x[..., col].clamp(min=1e-9))
+            x_norm = (x - predicate.feat_mean) / (predicate.feat_std + 1e-8)
+            skip_out = predicate.skip(x_norm).squeeze(-1).item()
+            mlp_out  = predicate.mlp(x_norm).squeeze(-1).item()
+        return skip_out, mlp_out
+
+    for label, idx in [("lowest-P", idx_lo), ("highest-P", idx_hi)]:
+        x_pt = make_features(test_data)[[idx]]
+        s, m_ = _skip_mlp(predicate, x_pt)
+        print(f"{label}  (P={ho_P[idx]:.1f} atm):  skip={s:.4f}  mlp={m_:.4f}")
+    print()
+
     # ---- Figures -----------------------------------------------------------
     FIGURES_DIR.mkdir(exist_ok=True)
 
