@@ -1,118 +1,120 @@
-# Axiom-AI: Validity-Predicate-Based Theory Breakdown Detection
+# Axiom-AI: Assumption-Aware Theory Breakdown Detection
 
-A neurosymbolic system that detects when a physical theory breaks down in regimes never seen during training — by tracking the validity of explicit physical assumptions rather than flagging anomalies in raw data.
+A neurosymbolic system that detects when a physical theory breaks down in regimes never seen during training — by learning from the theory's own residual rather than from labeled breakdown events.
 
 ---
 
 ## Core Idea
 
 Standard anomaly detectors ask: *"does this data look unusual?"*  
-This system asks: *"are the assumptions that underpin this equation still physically valid?"*
+This system asks: *"is the theory's residual growing, and where?"*
 
-Each physical assumption (e.g. "molecules have negligible volume") gets its own **validity predicate** — a small skip-connection MLP trained only on data where that assumption holds. At inference time, the predicate extrapolates: when physical conditions move outside the learned validity region, the predicate fires. Because every derived result tracks which assumptions it depends on (provenance), flagging propagates automatically downstream through the axiom graph.
+Each physical theory (ideal gas, Hooke's law, Fourier conduction) gets a **residual-based validity predicate** — a skip-connection MLP trained on raw observables to predict the log theory residual. The model never sees breakdown criteria, correction parameters, or high-pressure data. It must learn from low-residual training states and extrapolate to flag high-residual held-out regimes.
 
-```text
-Physical state
-     │
-     ▼
-┌─────────────────────────────────────────────┐
-│  Validity Predicates  (one per assumption)  │
-│  A1: score = 0.03 → FLAGGED                 │
-│  A2: score = 0.12 → FLAGGED                 │
-│  A3: score = 0.91 → ok                      │
-│  A4: score = 0.88 → ok                      │
-└─────────────────────────────────────────────┘
-     │  provenance propagation
-     ▼
-┌─────────────────────────────────────────────┐
-│  Derived results flagged by union rule:     │
-│  D2, D4, D5, D6 → SUSPECT                  │
-│  D1, D3         → clean                    │
-└─────────────────────────────────────────────┘
-```
+The longer-term goal is a three-stage loop:
 
----
+1. **Stage 1 — Detect:** Learn where the base theory's residual is growing, from raw observables, no criterion given.  
+2. **Stage 2 — Discover:** In the flagged region, use sparse regression to discover the correction term (e.g., van der Waals a, b terms). The Stage 1 flag is used to target a small additional sample for the regression, tested against baselines for sample efficiency.  
+3. **Stage 3 — Recurse:** Apply Stage 1 to the corrected model to find its own new validity boundary.
 
-## Key Results
-
-Three physical domains tested — all trained exclusively on valid-regime data, evaluated on held-out breakdown regimes.
-
-### Pilot 1 — Ideal Gas (PV = nRT)
-
-| Assumption | Criterion | Recall | AUROC |
-| --- | --- | --- | --- |
-| A1 Point particles | (V/n)/b > 10 | **1.000** | 1.000 |
-| A2 No forces | a·n/(VRT) < 0.10 | **1.000** | 1.000 |
-
-Training: P = 1–10 atm. Held-out: P = 50–200 atm (van der Waals regime). The learned decision boundary aligns with the analytical van der Waals boundary without ever seeing high-pressure data.
-
-### Pilot 2 — Hooke's Law (σ = Eε)
-
-| Assumption | Criterion | Recall | AUROC |
-| --- | --- | --- | --- |
-| A1 Linearity | stress\_ratio < 0.90 | **1.000** | 1.000 |
-| A2 Elasticity | strain\_energy\_ratio < 0.80 | **1.000** | 1.000 |
-| A3 Small strain | ε < 0.85 ε\_y | **1.000** | 1.000 |
-
-Training: ε < 0.5 ε\_y (elastic regime). Held-out: ε > 1.5 ε\_y (post-yield). Key finding: feeding all three features to every predicate causes recall to collapse to 0.0 (collinearity sign-flip). Fix: per-assumption feature isolation.
-
-### Pilot 3 — Fourier Heat Conduction (q = −k∇T, Silicon)
-
-| Assumption | Attempt 1 | Attempt 2 | Attempt 3 |
-| --- | --- | --- | --- |
-| A1 Continuum (Kn < 0.1) | 0.165 | **0.937** | 0.792 |
-| A2 Steady-state (Fo > 1) | 0.190 | **0.873** | 0.285 |
-| A3 Linear response | 0.273 | **1.000** | **1.000** |
-| A4 Local equilibrium (t > 1 ps) | 0.000 | 0.000 | 0.000 |
-
-A4 fails due to a structural calibration bias: training t ∈ [1 ns, 1 s] puts the mean log-criterion at ≈ 22, the combined skip+MLP output is ≈ 12 at the boundary (t = 1 ps) — 12.9× too large to cross the 0.5 threshold.
+Current status: Stage 1 complete; Stage 2 attempted once (failure documented).
 
 ---
 
 ## Architecture
 
-### Validity Predicate (skip-connection MLP)
+### Residual Predicate (skip-connection MLP)
 
 ```text
-input features (optionally log-transformed + normalized)
-        │
-   ┌────┴──────────────────────────────┐
-   │  Skip path: Linear(n→1)          │  ← learns linear extrapolation trend
-   │  MLP  path: Linear-ReLU-Linear   │  ← learns nonlinear in-distribution residual
-   └────┬──────────────────────────────┘
+raw observables [P, V, T, n]
+        │  log-transform + normalize
+        ▼
+   ┌────┴───────────────────────────────┐
+   │  Skip path: Linear(4 → 1)         │  ← learns linear extrapolation trend
+   │  MLP  path: Linear-ReLU-...-Linear│  ← learns nonlinear in-distribution fit
+   └────┬───────────────────────────────┘
         │  sum
         ▼
-     raw logit
-        │  sigmoid
-        ▼
-     score ∈ (0, 1)   >0.5 = valid,  <0.5 = flagged
+   log(residual)   [regression target, no sigmoid]
 ```
 
-**Why the skip connection is critical:** All training data is valid, so all regression targets are positive. Without the skip, the MLP collapses to a large positive constant (≈ training mean) and never fires on out-of-distribution inputs. The skip's linear extrapolation into the held-out regime is what carries the flag signal.
+**Why the skip connection is critical:** All training data is in the valid regime, so the MLP collapses to a constant. The skip's linear extrapolation beyond the training hull is what carries the breakdown signal.
 
-**Training target:** `log(criterion / threshold)` — positive in training, zero at boundary, negative for violations. Regression on this log-criterion (rather than soft or binary labels) gives non-zero gradients throughout the training range.
+**Training target:** `log(|theory residual|)` — positive/small in training, grows as theory breaks down. MSE regression; no breakdown criterion baked in.
 
-**Regularization:** `weight_decay = 0` on skip (free to learn trend), `weight_decay = 5.0` on MLP (kept near zero outside training hull so skip dominates in extrapolation).
+**Regularization:** `weight_decay = 0` on skip (free to learn trend), `weight_decay = 5.0` on MLP (kept near zero OOD so skip dominates in extrapolation).
 
-### Provenance Propagation
-
-A node is flagged if **any** ancestor assumption fires. Implemented as a static OR over per-assumption flag arrays — no re-traversal of the graph per state.
+**Calibration:** detection threshold = training mean + 3σ of log(residual). Anything above fires the predicate.
 
 ---
 
-## Failure Modes Discovered
+## Results
 
-### Collinearity sign-flip (Hooke's Law)
+### Stage 1 — Ideal Gas Residual Predicate (Pilot 1 Reformulation)
 
-When training features are algebraically related (stress\_ratio ≡ ε/ε\_y, strain\_energy\_ratio ≡ stress\_ratio²), the skip regression has infinitely many solutions. Gradient descent randomly assigns signs; a positive weight on strain\_energy\_ratio produces logits of +628 to +1058 in the held-out regime → recall = 0.000.
+Trained on (P, V, T, n) from the CO2 van der Waals EOS at P = 1–10 atm. Target: log(|PV/nRT − 1|). Not given: a, b, or any breakdown criterion.
 
-**Fix:** Per-assumption feature isolation — each predicate sees only the one feature in its own validity criterion.
+Evaluated on P = 50–200 atm (never seen in training):
+
+| Metric | Value | Note |
+| ------ | ----- | ---- |
+| AUROC | **0.999** | vs 0.921 for pressure-only linear baseline |
+| Recall | **1.000** | all 948/1000 broken states detected |
+| Precision | 0.948 | at calibrated 3σ threshold |
+| Pearson r | 0.963 | correct trend extrapolated |
+| R² | −4.06 | systematic +1.25 log-unit upward bias (characterized) |
+
+The model learned that higher P / smaller V / lower T predicts larger residual — physically correct, from raw observables, with no hints.
+
+### Stage 1 — Pilots 1–3 (original, criterion-based predicates)
+
+The original predicate formulation used `log(criterion/threshold)` as the training target, which encodes the known validity boundary directly. This gives perfect results by construction (Recall = 1.000, AUROC = 1.000 across all valid assumptions in all three domains) but is circular: the model evaluates a formula, not discovers a relationship.
+
+These results are kept as architecture validation — they confirm the skip+MLP design extrapolates correctly when the boundary is known.
+
+| Domain | Assumptions | Recall | AUROC |
+| ------ | ----------- | ------ | ----- |
+| Ideal gas (PV = nRT) | A1 point particles, A2 no forces | 1.000 | 1.000 |
+| Hooke's law (σ = Eε) | A1 linearity, A2 elasticity, A3 small strain | 1.000 | 1.000 |
+| Fourier conduction (q = −k∇T) | A1 continuum, A2 steady-state, A3 linear response | 0.873–1.000 | — |
+| Fourier conduction | A4 local equilibrium (t > 1 ps) | 0.000 | 0.999 |
+
+Fourier A4 fails because the calibration bias is too large: training t ∈ [1 ns, 1 s] puts the skip output far above zero at the boundary (t = 1 ps). AUROC = 0.999 confirms correct ranking; threshold is never crossed.
+
+### Stage 2 — Correction-Term Discovery (Attempt 1, failed)
+
+STLSQ sparse regression on an 11-term library to recover the vdW correction r ≈ (b − a/RT)·(n/V) + b²·(n/V)² from data. Three conditions compared (A: low-P only, B: full range, C: low-P + 50 Stage-1-targeted points).
+
+| Condition | Hi-P pts | Terms selected | Test R² |
+| --------- | -------- | -------------- | ------- |
+| A (P = 1–10) | 0 | n/V, (n/V)², (n/V)³, P/T, 1/T, n/T | −10,282,988 |
+| B (P = 1–200) | 1000 | n/V, (n/V)², P/T, 1/T, n/T | +0.970 |
+| C (P = 1–10 + 50 targeted) | 50 | n/V, (n/V)², P/T, 1/T, n/T | −15.025 |
+
+**Root cause:** In vdW-generated data, V is smooth in P and T, so n/V ≈ P/(RT). Pearson r(n/V, P/T) = 0.9999 in training. OLS cannot distinguish them; STLSQ retains a spurious linear combination that fits in-distribution but catastrophically extrapolates. Condition number of the column-normalized 11-term matrix: 1615. Removing P/T and P*V from the library drops the condition number to 212.
+
+The Stage-1 targeting idea is not falsified — the failure is in library collinearity, not in the targeting mechanism.
+
+Full diagnosis: [STAGE2_ATTEMPT1_SUMMARY.md](STAGE2_ATTEMPT1_SUMMARY.md).
+
+---
+
+## Failure Modes
+
+### Collinearity sign-flip (Hooke's, Criterion-based)
+
+When training features are algebraically related (stress_ratio ≡ ε/ε_y exactly), the skip regression has infinitely many solutions. A random positive weight on a correlated feature produces logits of +628 to +1058 OOD → recall = 0.  
+**Fix:** Per-assumption feature isolation — each predicate sees only its own criterion feature.
 
 ### Calibration bias (Fourier A4)
 
-When the training regime is far from the validity boundary in log-criterion space (A4: training t ∈ [1 ns, 1 s], boundary at t = 1 ps, mean log-criterion ≈ 22), the combined skip+MLP output saturates well above 0 everywhere. The predicate cannot fire even though AUROC = 0.999 (it correctly ranks states but threshold is never crossed).
+When the training-to-boundary gap in log-criterion space is large (1000× for A4), the skip output never crosses zero at the boundary.  
+**Diagnosable in advance:** if mean(log-criterion) ≫ 0 on training data, the predicate cannot fire. Fix: shrink training regime, or use a calibrated per-assumption threshold.
 
-**Diagnosable in advance:** if `mean(log-criterion)` on training data is large (≫ 0), calibration bias is guaranteed. Fix: shrink training regime to bring training-boundary gap below ≈ 5×, or use a per-assumption calibrated threshold.
+### Library collinearity (Stage 2)
+
+When training data is generated by a smooth EOS, physically distinct library terms become numerically indistinguishable. OLS distributes coefficient mass arbitrarily; STLSQ cannot recover the sparse true solution regardless of threshold or sample size.  
+**Proposed fix:** dimensionless library terms that are physically orthogonal by construction.
 
 ---
 
@@ -120,60 +122,53 @@ When the training regime is far from the validity boundary in log-criterion spac
 
 ```text
 project/
-├── CLAUDE.md                     # project instructions
-├── DECISIONS.md                  # architectural decisions log
+├── CLAUDE.md                            # project instructions (start here)
+├── STATUS.md                            # current state, open problem, next step
+├── DECISIONS.md                         # architectural decisions (7 entries)
+├── RESULTS_LOG.md                       # dated experiment records
+├── STAGE2_ATTEMPT1_SUMMARY.md           # Stage 2 collinearity failure analysis
 ├── data/
-│   └── generate.py               # synthetic data for all three domains
-├── axiom_graph/
-│   ├── nodes.py                  # AssumptionNode, DerivedNode
-│   ├── edges.py                  # Entailment edges
-│   └── graph.py                  # AxiomGraph + domain-specific builders
+│   ├── generate.py                      # ideal gas, Hooke's, Fourier data generators
+│   └── generate_vdw_residual.py         # PR-EOS ground truth, vdW residual target
+├── axiom_graph/                         # provenance tracking (existing, validated)
+├── reasoner/                            # forward chain + provenance (existing, validated)
 ├── validity_predicates/
-│   ├── predicate.py              # ValidityPredicate (skip-connection MLP)
-│   ├── train.py                  # training loops for all three domains
-│   └── evaluate.py               # recall / AUROC evaluation
-├── reasoner/
-│   ├── forward_chain.py          # run_forward_chain() → ForwardChainResult
-│   └── provenance.py             # compute_provenance() → static assumption footprints
+│   ├── predicate.py                     # original criterion-based ValidityPredicate
+│   ├── residual_predicate.py            # ResidualPredicate (Stage 1, no criterion)
+│   ├── train_residual.py                # training loop for residual predicate
+│   └── evaluate_residual.py            # evaluation + calibrated AUROC
+├── symbolic_regression/
+│   ├── library.py                       # 10-term candidate feature library
+│   └── sparse_regression.py            # STLSQ implementation
 ├── experiments/
-│   ├── pilot.py                  # main 3-domain experiment script
-│   ├── plot_pilot1_boundary.py   # Pilot 1 decision boundary figure
-│   ├── plot_pilot1_provenance.py # Pilot 1 provenance DAG figure
-│   ├── plot_pilot2_boundary.py   # Pilot 2 validity score vs strain
-│   ├── plot_pilot2_collinearity.py # Pilot 2 collinearity failure figure
-│   ├── plot_pilot3_recall.py     # Pilot 3 grouped recall bar chart
-│   ├── plot_pilot3_a4_failure.py # Pilot 3 A4 calibration bias figure
-│   └── plot_oneclass_comparison.py # Schematic: anomaly detection vs validity predicate
-├── figures/                      # generated PNG outputs (300 dpi)
+│   ├── pilot.py                         # 3-domain pilot (criterion-based)
+│   ├── stage2_comparison.py            # A/B/C condition comparison
+│   ├── train_vdw_predicate.py          # Stage 1 on PR-EOS data
+│   └── plot_pilot*.py                  # figures for Pilots 1–3
 └── tests/
     └── test_provenance.py
 ```
 
 ---
 
-## Running the Experiments
+## Running Things
 
 ```bash
-# Install dependencies
-pip install numpy torch matplotlib pytest sympy
+# Stage 1 — residual predicate (ideal gas)
+python validity_predicates/train_residual.py
+python validity_predicates/evaluate_residual.py
 
-# Run the full 3-domain pilot experiment
+# Stage 2 — sparse correction-term recovery
+python experiments/stage2_comparison.py
+
+# Stage 1 on PR-EOS ground truth (CO2, near-critical held-out)
+python experiments/train_vdw_predicate.py
+
+# Original 3-domain pilot (criterion-based, for architecture reference)
 python experiments/pilot.py
-
-# Generate individual figures
-python experiments/plot_pilot1_boundary.py
-python experiments/plot_pilot1_provenance.py
-python experiments/plot_pilot2_boundary.py
-python experiments/plot_pilot2_collinearity.py
-python experiments/plot_pilot3_recall.py
-python experiments/plot_pilot3_a4_failure.py
-python experiments/plot_oneclass_comparison.py
-
-# Run tests
-pytest tests/
 ```
 
-> **Windows note:** prepend `$env:KMP_DUPLICATE_LIB_OK="TRUE";` to each command if you see an OpenMP DLL conflict.
+> **Windows:** prepend `$env:KMP_DUPLICATE_LIB_OK="TRUE";` if you see an OpenMP DLL conflict.
 
 ---
 
@@ -181,18 +176,19 @@ pytest tests/
 
 See [DECISIONS.md](DECISIONS.md) for full rationale. Summary:
 
-1. **Skip connection is critical** — guarantees linear extrapolation into held-out regimes; plain MLP collapses to training-mean constant.
-2. **Log-transform is domain-specific** — ideal gas features (P, V, T, n) need log-transform; Hooke's engineered ratios do not.
-3. **Regression on log-criterion, not classification** — avoids zero-gradient problem from saturated sigmoid labels.
-4. **Provenance union is sufficient** — flag OR over ancestor assumptions; no re-traversal needed.
+1. **Skip connection is critical** — guarantees linear extrapolation OOD; plain MLP collapses to training-mean constant.
+2. **Log-transform is domain-specific** — ideal gas raw features need log-transform; Hooke's engineered ratios do not.
+3. **Regression on log(residual), not classification** — avoids zero-gradient problem from saturated sigmoid labels.
+4. **Provenance union is sufficient** — flag propagation is OR over ancestor assumptions; no re-traversal needed.
 5. **Feature isolation prevents collinearity sign-flip** — required when domain features are algebraically dependent.
-6. **Per-criterion feature isolation is domain-specific** — Fourier observables are independently sampled; Hooke's features are not.
-7. **Calibration bias is diagnosable from training data** — large mean(log-criterion) in training predicts A4-style failure.
+6. **Per-criterion isolation is not universal** — Fourier observables are independently sampled; Hooke's are not.
+7. **Calibration bias is diagnosable from training data** — large mean(log-criterion) predicts A4-style failure.
 
 ---
 
 ## Related Work
 
-- **AI-Hilbert** (Cornelio et al., 2023, *Nature Communications*) — finds axioms inconsistent with observed data. We flag axioms that break in unseen regimes; that's the gap.
-- **de Kleer & Brown** (1984–87) — ATMS, the conceptual precursor. Discrete/propositional, no learned components. We extend with continuous learned validity.
+- **AI-Hilbert** (Cornelio et al., 2023, *Nature Communications*) — finds axioms inconsistent with observed data. We flag axioms that break in unseen regimes from the residual alone; that is the gap.
+- **de Kleer & Brown** (1984–87) — ATMS, conceptual precursor. Discrete/propositional, no learned components. We extend with continuous learned validity.
+- **SINDy** (Brunton et al., 2016) — sparse regression for equation discovery from data. Stage 2 uses STLSQ from this framework for correction-term discovery.
 - **Neural Theorem Provers** (Rocktäschel & Riedel, 2017) — differentiable reasoning over symbolic structures; architectural family reference.
