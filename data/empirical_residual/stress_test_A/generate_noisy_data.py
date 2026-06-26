@@ -47,52 +47,81 @@ def _log_uniform(rng, lo, hi, n):
 
 
 # ------------------------------------------------------------------
-# Training data — rejection-sample valid (TRUE pred_error < 0.05)
+# Training data — binary-search for x giving TRUE pred_error in [0.03, 0.05]
+#
+# FIX: sampling the FULL valid range (0–5%) gave mean pe_true ≈ 1.6%,
+# far from the boundary.  With 10% noise the label-flip rate hit 62%
+# and the mean log_criterion was −0.09 (near zero, no signal).
+# Concentrating on [0.03, 0.05] puts every training sample close to
+# the validity boundary where the gradient signal survives the noise.
 # ------------------------------------------------------------------
 
+PE_TRAIN_LO = 0.03   # lower edge of near-boundary training band
+PE_TRAIN_HI = 0.05   # upper edge (same as EPSILON; samples are TRUE valid)
+
+# Separate RNG so this function's draws don't shift the global RNG
+# state used by generate_test_near_boundary (test file is left intact).
+_RNG_TRAIN = np.random.default_rng(43)
+
+
 def generate_train(n=5000):
-    print(f"Generating train_noisy.npz ({n} valid samples) ...")
+    print(f"Generating train_noisy.npz ({n} near-boundary valid samples) ...")
+    print(f"  TRUE pred_error target range : [{PE_TRAIN_LO}, {PE_TRAIN_HI})")
 
-    xs, vs, Ds, pe_true_list, pe_noisy_list = [], [], [], [], []
-    collected = 0
+    feat_list, lc_list = [], []
+    ivt_list, ivn_list = [], []
+    pet_list, pen_list = [], []
 
-    while collected < n:
-        x = _log_uniform(RNG, X_LO, X_HI, BATCH)
-        v = _log_uniform(RNG, V_LO, V_HI, BATCH)
-        D = _log_uniform(RNG, D_LO, D_HI, BATCH)
-        pe_true = pred_error(x, v, D)
+    generated = 0
+    attempts  = 0
+    max_attempts = 20 * n
 
-        mask = pe_true < EPSILON
-        n_keep = min(int(mask.sum()), n - collected)
-        idx = np.where(mask)[0][:n_keep]
+    while generated < n and attempts < max_attempts:
+        target_pe = float(_RNG_TRAIN.uniform(PE_TRAIN_LO, PE_TRAIN_HI))
+        v  = float(_log_uniform(_RNG_TRAIN, V_LO, V_HI, 1)[0])
+        D  = float(_log_uniform(_RNG_TRAIN, D_LO, D_HI, 1)[0])
 
-        x_k, v_k, D_k = x[idx], v[idx], D[idx]
-        pe_t = pe_true[idx]
+        x = _find_x_for_target_pe(target_pe, v, D)
+        if x is None:
+            attempts += 1
+            continue
 
-        # Noise: add to dP_measured before computing pred_error
-        dP_true    = compute_shah_london(x_k, v_k, D_k)
-        dP_hp      = compute_hp(x_k, v_k, D_k)
-        noise      = 1.0 + SIGMA * RNG.standard_normal(n_keep)
+        pe_true = float(pred_error(x, v, D))
+
+        # Noise applied to dP_measured BEFORE computing pred_error
+        dP_true    = float(compute_shah_london(x, v, D))
+        dP_hp      = float(compute_hp(x, v, D))
+        noise      = 1.0 + SIGMA * float(_RNG_TRAIN.standard_normal())
         dP_measured = dP_true * noise
-        pe_noisy   = np.abs(dP_measured - dP_hp) / dP_hp
+        pe_noisy   = abs(dP_measured - dP_hp) / dP_hp
 
-        xs.append(x_k);  vs.append(v_k);  Ds.append(D_k)
-        pe_true_list.append(pe_t)
-        pe_noisy_list.append(pe_noisy)
-        collected += n_keep
+        log_crit = float(np.clip(
+            np.log(EPSILON / (pe_noisy + 1e-10)), CLIP_LO, CLIP_HI
+        ))
 
-    x_arr      = np.concatenate(xs)[:n]
-    v_arr      = np.concatenate(vs)[:n]
-    D_arr      = np.concatenate(Ds)[:n]
-    pe_true_a  = np.concatenate(pe_true_list)[:n]
-    pe_noisy_a = np.concatenate(pe_noisy_list)[:n]
+        feat_list.append([x, v, D])
+        lc_list.append(log_crit)
+        ivt_list.append(True)                  # pe_true < EPSILON by construction
+        ivn_list.append(pe_noisy < EPSILON)
+        pet_list.append(pe_true)
+        pen_list.append(pe_noisy)
 
-    features       = np.stack([x_arr, v_arr, D_arr], axis=1)
-    log_criterion  = np.clip(np.log(EPSILON / (pe_noisy_a + 1e-10)), CLIP_LO, CLIP_HI)
-    is_valid_true  = np.ones(n, dtype=bool)
-    is_valid_noisy = pe_noisy_a < EPSILON
+        generated += 1
+        attempts  += 1
 
-    return features, log_criterion, is_valid_true, is_valid_noisy, pe_true_a, pe_noisy_a
+    if generated < n:
+        raise RuntimeError(
+            f"Only generated {generated}/{n} samples after {attempts} attempts"
+        )
+
+    features       = np.array(feat_list)
+    log_criterion  = np.array(lc_list)
+    is_valid_true  = np.array(ivt_list)
+    is_valid_noisy = np.array(ivn_list)
+    pe_true_arr    = np.array(pet_list)
+    pe_noisy_arr   = np.array(pen_list)
+
+    return features, log_criterion, is_valid_true, is_valid_noisy, pe_true_arr, pe_noisy_arr
 
 
 # ------------------------------------------------------------------

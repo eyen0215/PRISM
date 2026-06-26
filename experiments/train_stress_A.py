@@ -301,11 +301,11 @@ def comparison_table(eff_w_noisy: np.ndarray, metrics: dict) -> None:
     print()
     auroc = metrics["auroc_nn"]
     if auroc >= 0.80:
-        verdict = f"ROBUST  — AUROC {auroc:.3f} ≥ 0.80 despite 10% noise"
+        verdict = f"ROBUST  -- AUROC {auroc:.3f} >= 0.80 despite 10% noise"
     elif auroc >= 0.70:
-        verdict = f"MARGINAL — AUROC {auroc:.3f} in [0.70, 0.80); noise is significant"
+        verdict = f"MARGINAL -- AUROC {auroc:.3f} in [0.70, 0.80); noise is significant"
     else:
-        verdict = f"FRAGILE  — AUROC {auroc:.3f} < 0.70; noise overwhelms signal"
+        verdict = f"FRAGILE  -- AUROC {auroc:.3f} < 0.70; noise overwhelms signal"
     print(f"  Verdict: {verdict}")
     print()
 

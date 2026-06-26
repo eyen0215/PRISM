@@ -163,8 +163,8 @@ re_tr, eps_tr, err_tr = [], [], []
 collected = 0
 
 while collected < 5000:
-    Re  = _log_uniform(RNG, 4_000,  80_000, BATCH)
-    eps = _log_uniform(RNG, 1e-7,   1e-5,   BATCH)
+    Re  = _log_uniform(RNG, 4_000,  180_000, BATCH)   # FIX 2: was 80_000
+    eps = _log_uniform(RNG, 1e-7,   3e-5,    BATCH)   # FIX 2: was 1e-5
     pe  = pred_error_fn(Re, eps)
 
     mask  = pe < EPSILON
@@ -193,63 +193,71 @@ np.savez(
 )
 
 # ------------------------------------------------------------------
-# 2. Test data — breakdown regime (pred_error > 0.05)
+# 2. Test data — regenerate only if file is missing (FIX 2: train-only)
 # ------------------------------------------------------------------
-print("Generating test_colebrook.npz (1 000 breakdown samples) ...")
+_test_path = os.path.join(OUTDIR, "test_colebrook.npz")
+if not os.path.exists(_test_path):
+    print("Generating test_colebrook.npz (1 000 breakdown samples) ...")
 
-re_te, eps_te, err_te = [], [], []
-collected = 0
+    re_te, eps_te, err_te = [], [], []
+    collected = 0
 
-while collected < 1000:
-    Re  = _log_uniform(RNG, 4_000,  500_000, BATCH)
-    eps = _log_uniform(RNG, 1e-7,   1e-3,    BATCH)
-    pe  = pred_error_fn(Re, eps)
+    while collected < 1000:
+        Re  = _log_uniform(RNG, 4_000,  500_000, BATCH)
+        eps = _log_uniform(RNG, 1e-7,   1e-3,    BATCH)
+        pe  = pred_error_fn(Re, eps)
 
-    mask   = pe > EPSILON
-    n_keep = min(int(mask.sum()), 1000 - collected)
-    idx    = np.where(mask)[0][:n_keep]
+        mask   = pe > EPSILON
+        n_keep = min(int(mask.sum()), 1000 - collected)
+        idx    = np.where(mask)[0][:n_keep]
 
-    re_te.append(Re[idx]);  eps_te.append(eps[idx]);  err_te.append(pe[idx])
-    collected += n_keep
+        re_te.append(Re[idx]);  eps_te.append(eps[idx]);  err_te.append(pe[idx])
+        collected += n_keep
 
-Re_te   = np.concatenate(re_te)[:1000]
-eps_te  = np.concatenate(eps_te)[:1000]
-err_te  = np.concatenate(err_te)[:1000]
+    Re_te   = np.concatenate(re_te)[:1000]
+    eps_te  = np.concatenate(eps_te)[:1000]
+    err_te  = np.concatenate(err_te)[:1000]
 
-features_te  = np.stack([Re_te, eps_te], axis=1)
-is_valid_te  = np.zeros(1000, dtype=bool)
+    features_te  = np.stack([Re_te, eps_te], axis=1)
+    is_valid_te  = np.zeros(1000, dtype=bool)
 
-np.savez(
-    os.path.join(OUTDIR, "test_colebrook.npz"),
-    features   = features_te,
-    is_valid   = is_valid_te,
-    pred_error = err_te,
-)
+    np.savez(
+        _test_path,
+        features   = features_te,
+        is_valid   = is_valid_te,
+        pred_error = err_te,
+    )
+else:
+    print(f"Skipping test_colebrook.npz (already exists).")
 
 # ------------------------------------------------------------------
-# 3. Grid — 50×50 over full (Re, eps) space
+# 3. Grid — regenerate only if file is missing (FIX 2: train-only)
 # ------------------------------------------------------------------
-print("Generating grid_colebrook.npz (2 500 grid points) ...")
+_grid_path = os.path.join(OUTDIR, "grid_colebrook.npz")
+if not os.path.exists(_grid_path):
+    print("Generating grid_colebrook.npz (2 500 grid points) ...")
 
-Re_grid  = np.logspace(np.log10(4_000),  np.log10(500_000), 50)
-eps_grid = np.logspace(np.log10(1e-7),   np.log10(1e-3),    50)
+    Re_grid  = np.logspace(np.log10(4_000),  np.log10(500_000), 50)
+    eps_grid = np.logspace(np.log10(1e-7),   np.log10(1e-3),    50)
 
-RR, EE     = np.meshgrid(Re_grid, eps_grid)   # each (50, 50)
-Re_flat    = RR.ravel()
-eps_flat   = EE.ravel()
-err_grid   = pred_error_fn(Re_flat, eps_flat)
+    RR, EE     = np.meshgrid(Re_grid, eps_grid)   # each (50, 50)
+    Re_flat    = RR.ravel()
+    eps_flat   = EE.ravel()
+    err_grid   = pred_error_fn(Re_flat, eps_flat)
 
-features_grid    = np.stack([Re_flat, eps_flat], axis=1)
-true_valid_grid  = err_grid < EPSILON
+    features_grid    = np.stack([Re_flat, eps_flat], axis=1)
+    true_valid_grid  = err_grid < EPSILON
 
-np.savez(
-    os.path.join(OUTDIR, "grid_colebrook.npz"),
-    features        = features_grid,
-    pred_error_grid = err_grid,
-    true_valid_grid = true_valid_grid,
-    Re_grid         = Re_grid,
-    eps_grid        = eps_grid,
-)
+    np.savez(
+        _grid_path,
+        features        = features_grid,
+        pred_error_grid = err_grid,
+        true_valid_grid = true_valid_grid,
+        Re_grid         = Re_grid,
+        eps_grid        = eps_grid,
+    )
+else:
+    print(f"Skipping grid_colebrook.npz (already exists).")
 
 # ------------------------------------------------------------------
 # 4. Diagnostics
@@ -261,15 +269,6 @@ print(f"train_colebrook : {len(Re_tr):>6} samples | "
       f"pred_error mean = {err_tr.mean():.5f}  (all < 0.05)")
 print(f"  Re  range : [{Re_tr.min():.0f}, {Re_tr.max():.0f}]")
 print(f"  eps range : [{eps_tr.min():.2e}, {eps_tr.max():.2e}]")
-print()
-print(f"test_colebrook  : {len(Re_te):>6} samples | "
-      f"pred_error mean = {err_te.mean():.5f}  (all > 0.05)")
-print(f"  Re  range : [{Re_te.min():.0f}, {Re_te.max():.0f}]")
-print(f"  eps range : [{eps_te.min():.2e}, {eps_te.max():.2e}]")
-print()
-valid_frac = true_valid_grid.mean()
-print(f"grid_colebrook  : {len(Re_flat):>6} points  | "
-      f"valid fraction = {valid_frac:.3f}")
 print()
 
 # Breakdown Re for near-smooth pipe (eps = 1e-8, D = 0.1)
@@ -297,16 +296,14 @@ else:
 
 print()
 
-# Verify assertions
-assert features_tr.shape  == (5000, 2), f"train shape: {features_tr.shape}"
-assert features_te.shape  == (1000, 2), f"test shape:  {features_te.shape}"
-assert features_grid.shape == (2500, 2), f"grid shape:  {features_grid.shape}"
+# Verify train assertions
+assert features_tr.shape == (5000, 2), f"train shape: {features_tr.shape}"
 assert is_valid_tr.all(),  "all train samples must be valid"
-assert (~is_valid_te).all(), "all test samples must be breakdown"
-print("Shape assertions passed.")
+print("Shape assertions passed (train).")
 
 print()
 print("Files written:")
 for fname in ("train_colebrook.npz", "test_colebrook.npz", "grid_colebrook.npz"):
     fpath = os.path.join(OUTDIR, fname)
-    print(f"  {fpath}  ({os.path.getsize(fpath) // 1024} KB)")
+    if os.path.exists(fpath):
+        print(f"  {fpath}  ({os.path.getsize(fpath) // 1024} KB)")
